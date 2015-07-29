@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+
+'''
+Sample script creates some ec2 instances, applies security rules, and
+configures salt reporting to master.
+
+-Aaron Caito
+'''
+
+
+import boto.ec2, time, os
+
+access_key         = os.environ['AWS_ACCESS_KEY']
+secret_key         = os.environ['AWS_SECRET_KEY']
+
+image_ami          = "ami-7c797514"
+instance_type      = "t2.micro"
+sec_group_name     = "learn-salt-stack"
+subnet_id          = "subnet-6d5a1e1a"
+keypair_name       = "e2c-learn-salt-stack"
+security_group_ids = ['sg-b12000d5']
+
+
+def set_minion_data(master_ip='0.0.0.0'):
+    return """#cloud-config
+repo_update: true
+repo_upgrade: all
+
+packages:
+ - curl
+
+runcmd:
+ - [ sh, -c, "echo '"""+master_ip+""" salt.csw.io' >> /etc/hosts" ]
+ - [ sh, -c, "curl -L http://bootstrap.saltstack.org | sudo sh -s -- stable" ]
+ - [ sh, -c, "echo 'master: salt.csw.io' >> /etc/salt/minion" ]
+ - [ sh, -c, "echo 'file_roots:' >> /etc/salt/minion"]
+ - [ sh, -c, "echo '  base:' >> /etc/salt/minion"]
+ - [ sh, -c, "echo '    - /srv/salt/states' >> /etc/salt/minion"]
+ - [ sh, -c, "echo 'pillar_roots:' >> /etc/salt/minion"]
+ - [ sh, -c, "echo '  base:' >> /etc/salt/minion"]
+ - [ sh, -c, "echo '    - /srv/salt/pillars/base' >> /etc/salt/minion"]
+ - [ sh, -c, "echo 'log_file: /var/log/salt/minion' >> /etc/salt/minion"]
+ - [ sh, -c, "echo 'log_level: debug' >> /etc/salt/minion"]
+ - [ sh, -c, "echo 'log_level_logfile: garbage' >> /etc/salt/minion"]
+ - service salt-minion restart
+"""
+
+def set_master_data():
+    return """#cloud-config
+repo_update: true
+repo_upgrade: all
+
+packages:
+ - curl
+ - salt-master
+ - salt-minion
+
+runcmd:
+ - [ sh, -c, "echo 'localhost salt.csw.io' >> /etc/hosts" ]
+ - [ sh, -c, "curl -L http://bootstrap.saltstack.org | sudo sh -s -- stable" ]
+ - [ sh, -c, "echo master: salt.csw.io >> /etc/salt/minion" ]
+ - service salt-minion restart
+
+"""
+
+def make_reservation(count, instance_type=instance_type, keypair_name=keypair_name, user_data=''):
+    return conn.run_instances(image_id=image_ami,
+                                 min_count=count,
+                                 max_count=count,
+                                 key_name=keypair_name,
+                                 instance_type=instance_type,
+                                 subnet_id=subnet_id,
+                                 security_group_ids=security_group_ids,
+                                 user_data=user_data
+                                 )
+
+def get_or_create_key(keypair_name=keypair_name):
+    try:
+        key = conn.create_key_pair(keypair_name)
+        key.save("./")
+    except:
+        True # Key already created
+    return
+
+def clear_security_group():
+    try:
+        groups = [g for g in conn.get_all_security_groups() if g.name == sec_group_name]
+        group = groups[0] if groups else None
+
+        if not group:
+            group = conn.create_security_group(sec_group_name, "A group for %s"%(sec_group_name,))
+        for rule in group.rules:
+            for grant in rule.grants:
+                conn.revoke_security_group(group_id=group.id, ip_protocol=rule.ip_protocol, from_port=rule.from_port, to_port=rule.to_port, src_security_group_group_id=grant.group_id, cidr_ip=grant.cidr_ip)
+
+        group.authorize(ip_protocol='tcp',
+                      from_port=str(22),
+                      to_port=str(22),
+                      cidr_ip='0.0.0.0/0')
+        group.authorize(ip_protocol='tcp',
+                      from_port=str(80),
+                      to_port=str(80),
+                      cidr_ip='0.0.0.0/0')
+    except:
+        True
+    return
+
+def ensure_security_group(ip):
+    groups = [g for g in conn.get_all_security_groups() if g.name == sec_group_name]
+    group = groups[0] if groups else None
+    group.authorize(ip_protocol='tcp',
+                  from_port=str(4505),
+                  to_port=str(4505),
+                  cidr_ip=ip+'/32')
+    group.authorize(ip_protocol='tcp',
+                  from_port=str(4506),
+                  to_port=str(4506),
+                  cidr_ip=ip+'/32')
+    return
+
+
+conn = boto.ec2.connect_to_region('us-east-1',
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key)
+
+#print(set_master_data())
+clear_security_group()
+master_reservation = make_reservation(1, instance_type=instance_type, keypair_name=keypair_name, user_data=set_master_data())
+master = master_reservation.instances[0]
+
+status = master.update()
+while status == 'pending':
+    time.sleep(10)
+    status = master.update()
+
+if status == 'running':
+    master.add_tag("Name", "Salt Master")
+    print("Saltmaster > Ready at: ssh -i ~/.ssh/{}.pem admin@{}".format(keypair_name, master.ip_address))
+
+    #print(set_minion_data(master.ip_address))
+    minion_reservation = make_reservation(1, instance_type=instance_type, keypair_name=keypair_name, user_data=set_minion_data(master.ip_address))
+    minions = minion_reservation.instances[:]
+
+    for idx, minion in enumerate(minions):
+        while minion.update() != 'running':
+            time.sleep(10)
+            minion.update()
+        minion.add_tag("Name", "Minion "+str(idx+1))
+        ensure_security_group(minion.ip_address)
+        print("Minion {} > Ready at: ssh -i ~/.ssh/{}.pem admin@{}".format(idx+1, keypair_name, minion.ip_address))
+
+print("Push salt roots")
+print("ssh -i ~/.ssh/e2c-learn-salt-stack.pem admin@" + master.ip_address + " sudo mkdir -p /srv/salt && sudo chown admin -R /srv/salt")
+print("rsync -az -v -e 'ssh -i /Users/aaron/.ssh/e2c-learn-salt-stack.pem' `pwd`/deploy/salt/ admin@" + master.ip_address + ":/srv/salt")
+
+input("Press Enter to terminate...")
+conn.terminate_instances([instance.id for instance in minion_reservation.instances])
+conn.terminate_instances([instance.id for instance in master_reservation.instances])
+clear_security_group()
+#from pprint import pprint
+# for instance in reservation.instances:
+#     pprint(instance.__dict__)
